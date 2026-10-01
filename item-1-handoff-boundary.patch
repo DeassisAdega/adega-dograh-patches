@@ -1,6 +1,6 @@
 --- a/api/services/workflow/agent_handoff_context.py
 +++ b/api/services/workflow/agent_handoff_context.py
-@@ -163,6 +163,39 @@
+@@ -163,6 +163,43 @@
      span.set_status(Status(StatusCode.ERROR, reason))
  
  
@@ -12,7 +12,7 @@
 +# inherited foreign-language turn used to sit.
 +#
 +# This is a workaround. The real fix is for the snapshot to carry provenance:
-+# who said what, to which agent.
++# who said what, and to which agent.
 +_HANDOFF_BOUNDARY = {
 +    "role": "system",
 +    "content": (
@@ -44,7 +44,7 @@
  async def build_handoff_snapshot(
      context: "LLMContext",
      llm: Any,
-@@ -197,7 +230,7 @@
+@@ -197,7 +234,7 @@
          return HandoffSnapshot(messages=[], boundary=boundary, summarized=False)
  
      fallback = HandoffSnapshot(
@@ -53,7 +53,7 @@
          boundary=boundary,
          summarized=False,
      )
-@@ -273,7 +306,7 @@
+@@ -273,7 +310,7 @@
          f"Handoff compaction {request_id}: {len(source_messages)} messages -> "
          f"summary + {len(retained)} retained"
      )
