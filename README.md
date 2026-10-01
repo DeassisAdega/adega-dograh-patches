@@ -15,11 +15,14 @@ new bugs. **We would rather delete our patches than maintain them.**
 Generated from the running container against the pristine image, so they are what is actually in
 production here, not what we wrote first. Apply with `git apply` from the repository root.
 
-| file | defect | note |
-|---|---|---|
-| `item-1-handoff-boundary.patch` | The handoff snapshot carries no provenance, so the destination agent reads the caller's last request as its own | A workaround. The real fix is for the snapshot to say who spoke to which agent. |
-| `item-3-retire-before-opening.patch` | `retire()` races the destination's first generation and the opening speech is lost | `retire()` is idempotent, so the `finally` stays correct. |
-| `item-4-greeting-echo.patch` | Two words do not survive the echo of the greeting itself | **Do not merge the number.** 40 is a local stopgap; the threshold wants to be configurable. |
+| patch | touches | defect | note |
+|---|---|---|---|
+| `item-1-handoff-boundary.patch` | `api/services/workflow/agent_handoff_context.py` | The handoff snapshot carries no provenance, so the destination agent reads the caller's last request as its own | A workaround. The real fix is for the snapshot to say who spoke to which agent. |
+| `item-3-retire-before-opening.patch` | `api/services/workflow/agent_transfer.py` | `retire()` races the destination's first generation and the opening speech is lost | `retire()` is idempotent, so the `finally` stays correct. |
+| `item-4-greeting-echo.patch` | `api/services/pipecat/greeting.py` | Two words do not survive the echo of the greeting itself | **Do not merge the number.** 40 is a local stopgap; the threshold wants to be configurable. |
+
+The numbers are the item numbers in `DEFECTS.md`, which lists eight. They are not the
+one-two-three of the message that brought you here — go by the file each patch touches.
 
 ### On the boundary marker
 
