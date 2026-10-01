@@ -1,0 +1,19 @@
+--- a/api/services/workflow/agent_transfer.py
++++ b/api/services/workflow/agent_transfer.py
+@@ -184,6 +184,16 @@
+             engine.call_monitor.resume()
+             await engine.notify_agent_entered(destination)
+             start_node_id = destination.workflow.start_node_id
++            # Retire the source BEFORE opening the destination.
++            # retire() drains the old worker on the same shared pipeline. If that
++            # drain catches the destination's first generation mid-flight AND that
++            # generation is a tool call, the next generation -- the actual speech --
++            # is lost and the agent stays mute until the caller speaks again.
++            # Measured here: the EN->PT leg retires in ~65ms (before the generation
++            # exists, so no race); the PT->EN leg takes 2.056s, call after call --
++            # a two-second window. retire() is idempotent, so the finally block
++            # below simply awaits the same task.
++            await source.retire("transferred")
+             await engine.queue_node_opening(
+                 node_id=start_node_id,
+                 previous_node_id=None if request.play_greeting else start_node_id,

@@ -1,0 +1,17 @@
+--- a/api/services/pipecat/greeting.py
++++ b/api/services/pipecat/greeting.py
+@@ -52,7 +52,13 @@
+         controller = user.user_turn_controller
+         if self._playback.greeting_pending and self._normal_strategies is None:
+             self._normal_strategies = controller.user_turn_strategies
+-            greeting_strategy = MinWordsUserTurnStartStrategy(min_words=2)
++            # ADEGA saudacao: 2 palavras nao sobrevivem ao eco da propria saudacao -- medido em
++            # 4 de 13 ligacoes, onde o turno de "cliente" era literalmente
++            # "Thank you." / "Adega, gotcha, Cassini?", palavras que o proprio
++            # agente acabara de dizer. Quem fala por cima nao se perde: ao fim da
++            # saudacao o codigo abaixo restaura a estrategia normal e manda ela
++            # adotar o inicio de fala que ficou pendente.
++            greeting_strategy = MinWordsUserTurnStartStrategy(min_words=40)
+             self._turn_text = asyncio.get_running_loop().create_future()
+             await controller.update_strategies(
+                 UserTurnStrategies(
