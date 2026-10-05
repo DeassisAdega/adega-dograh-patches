@@ -285,6 +285,54 @@ which in a ring group is not a known individual. It will speak the caller's busi
 out loud to whoever picks up. That is the point, but it deserves to be a deliberate
 setting rather than always-on.
 
+### Update 2026-10-05 — you shipped it, and it works. One adjustment.
+
+`introduction_enabled` / `introduction_prompt` (#843) landed in 1.48.0 and it is better than
+what we had prototyped: the text follows the caller's language instead of being pinned to
+`pt-BR`, and the audio comes out in the agent's own voice through `create_tts_service`, not the
+default `<Say>` voice. The 25-word and 300-character validation, the two attempts and the
+"failures must never block the transfer" guarantee all match what we had found the hard way.
+Thank you.
+
+The one thing we changed is **who hears it**. `introduction_urls` is attached twice:
+
+| call site | leg | wanted? |
+|---|---|---|
+| `provider.py`, outbound `Calls.json` | the destination | yes |
+| `strategies.py`, inside `TwilioConferenceStrategy` | the **caller's** existing leg | no |
+
+The summary is for whoever answers. The caller just said all of it, so hearing it read back is
+only hold time before they are connected. `item-7-introduction-destination-only.patch` drops the
+second attachment; the first is untouched.
+
+**On the concern that the caller would not be able to join the conference.** We measured it on
+two real calls, 1.48.0 with the patch, Twilio, destination a FreePBX ring group:
+
+```
+transfer_introduction.py:158 | Transfer introduction ready words=19 audio_bytes=88960   (prepared in 1.8s)
+transfer_introduction.py:158 | Transfer introduction ready words=17 audio_bytes=96170   (prepared in 1.5s)
+```
+
+Both dialled, both answered, `destination_answered` / `status=success`, and the caller joined the
+conference normally. Confirmed by ear on our side: the summary was heard on one leg only, the
+right one, and the caller heard hold for those couple of seconds.
+
+That is consistent with the comment already in `process_introduction_status` — *"During Play the
+recipient hasn't joined the conference yet, so `endConferenceOnExit` cannot remove the waiting
+caller"* — which describes a caller already waiting in the conference while the destination is
+still playing. And the caller path the patch restores is the one that already runs whenever
+`introduction_enabled` is false.
+
+**What we would ask for instead of this patch:** `introduction_audience: both | destination`,
+defaulting to `both` so nothing changes for existing users. Happy to open the PR.
+
+**One loose end we have not investigated.** On the second call the `transfer-status` callback
+published `TRANSFER_FAILED` 24 seconds *after* the destination had already answered — the
+`completed` callback arriving at the end of the call, and `process_introduction_status` treats
+`completed` as a cancellation, including `end_transfer_leg(original_call_sid)`. Harmless for us
+because the call had ended anyway, but on a long call it looks like it could tear down a transfer
+that is already up.
+
 ## 8. Template variables have no way to take part of a value, so the agent guesses the digits
 
 `{{initial_context.caller_number}}` can only be rendered whole. The only filter is the

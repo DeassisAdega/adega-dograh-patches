@@ -1,0 +1,19 @@
+--- a/api/services/telephony/providers/twilio/strategies.py
++++ b/api/services/telephony/providers/twilio/strategies.py
+@@ -73,9 +73,13 @@
+     </Dial>
+ </Response>"""
+             data = {"Twiml": twiml}
+-            if transfer_context.introduction_audio_url:
+-                backend, _ = await get_backend_endpoints()
+-                data = introduction_urls(backend, transfer_context.transfer_id)
++            # Destination-only introduction. This leg is the CALLER's: the summary
++            # is for whoever answers, and the caller just said all of it, so
++            # hearing it read back only adds hold time before they are connected.
++            # Keeping the plain conference TwiML here is the same path that
++            # already runs whenever introduction_enabled is false.
++            # The destination's own clip is untouched: it is attached in
++            # provider.py on the outbound Calls.json and never passes through here.
+ 
+             logger.info(
+                 f"[Twilio Transfer] Transferring call to conference: {conference_name}"
