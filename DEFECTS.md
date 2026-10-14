@@ -377,6 +377,78 @@ measurement, because measuring it means creating a real booking: step 9 of our f
 copies "eight, eight, nine, one" will copy that too, and the caller writes down a
 confirmation number that does not exist.
 
+## 9. `play_greeting` is all or nothing: the destination either introduces itself or continues, never both
+
+**Where:** `api/services/workflow/agent_transfer.py` — `queue_node_opening()` at line 193;
+`api/services/workflow/pipecat_engine.py` — `queue_node_opening()`, the greeting branch returning
+at line 1101 and the generation branch at line 1103.
+
+`play_greeting` decides which of two things the destination does, and there is no way to ask for
+both:
+
+- **true** — `queue_node_opening` plays the Start Call greeting and **returns before the LLM runs**.
+  The destination introduces itself and then waits for the caller to speak again. The caller has
+  just been transferred and already said what they wanted; now they have to say it twice.
+- **false** — the opening is an LLM generation, and the introduction depends on the model
+  remembering to produce it. **Whenever that generation comes out as a tool call, the opening turn
+  is consumed by the tool and the introduction is lost.**
+
+We hit the second one on a real line. Our English agent hands over to a Portuguese agent; the
+Portuguese prompt orders the introduction in four separate places, one of them in position zero of
+all three entry nodes. Read off the traces of eleven real calls:
+
+| first Portuguese turn | introduced itself |
+|---|---|
+| **needed a knowledge-base lookup** | **0 of 2** |
+| did not | **9 of 9** |
+
+The prompt was in context — 60,293 characters, the rule present — and the model skipped it, because
+the opening turn had already been spent on `retrieve_from_knowledge_base`. This is not a prompting
+problem: a question that needs a lookup is the single most common way a transferred call starts.
+
+**What we would ask for:** a way to have the destination say a fixed line **and** carry on. We added
+an optional `transfer_greeting` to the transfer tool — a string spoken by the destination, in its
+own voice, before its first generated turn, used only when `play_greeting` is false. The node's own
+Start Call greeting stays for direct entry; this is the sentence for the handover, which is a
+different sentence (ours ends with "and I will continue your call in Portuguese", which makes no
+sense when nobody was transferred).
+
+**It works.** On real calls: introduction present on every handover since, exactly once, and the
+answer still arrives in the same breath. The gap between the end of the fixed line and the start of
+the answer went from 9.4 s to 7.4–7.9 s once we stopped blocking on playback (below).
+
+**Two things we found while building it, in case they save you time. Both cost us a deploy and a
+rollback.**
+
+1. **`tracker.greeting` is a single slot, and the second writer silently wins.**
+   `SpeechPlaybackTracker.create()` does `self.greeting = speech` for any speech flagged
+   `greeting=True` (`api/services/pipecat/speech_playback.py:157-158`). The generation branch of
+   `queue_node_opening` creates its own greeting-flagged speech, so ours is overwritten; then
+   `if self is self._owner.greeting` (`speech_playback.py:111`) is false, `on_greeting_finished`
+   never fires, and the text **never reaches the assistant context**
+   (`api/services/pipecat/greeting.py:131-132`). The agent has spoken a sentence it does not know it
+   spoke. Nothing logs this. We avoid it by not passing `greeting=True` at all — `mute_user` already
+   blocks interruption, and it is checked **before** the greeting exception in `should_mute_user`
+   (`pipecat_engine.py:1546-1551`).
+   Worth noting that `greeting=True` also silently overrides the caller's arguments —
+   `append_to_context` to `False` and `persist_to_logs` to `True` (`pipecat_engine.py:1462-1464`).
+   We passed `append_to_context=True` for two days and it did nothing.
+
+2. **Order is not guaranteed between `queue_speech` and `run_llm`.** `queue_speech` enqueues at the
+   head of the agent worker, so the `TTSSpeakFrame` must traverse the LLM processor to reach the
+   TTS; `run_llm` queues **straight onto the LLM** (`agent_runtime.py:160-167`). Whichever reaches
+   the LLM's process queue first wins, and the shortcut belongs to the LLM — so dropping the wait
+   altogether can play the answer **before** the greeting. Waiting for the speech to finish is
+   correct but costs the silence. The right synchronisation point is `speech.started`, set when the
+   opening boundary drains at the transport (`speech_playback.py:318-324`): by then the frame has
+   passed the LLM and anything queued after lands behind it. There is no public future for it, so we
+   poll with a ceiling.
+
+**The patch:** `item-9-destination-greeting-and-continuation.patch`. It touches
+`agent_transfer.py`, `pipecat_engine_custom_tools.py` and the `TransferAgentConfig` schema. We are
+not attached to the shape — a third value on `play_greeting`, or a `greeting_mode`, would do the
+same job. What we need is the combination.
+
 ## Other things we work around, on this same instance
 
 - **Knowledge-base retrieval is a per-node tool, and the model skips it about half the time.**

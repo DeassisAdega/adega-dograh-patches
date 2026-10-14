@@ -1,0 +1,96 @@
+--- a/api/services/workflow/agent_transfer.py
++++ b/api/services/workflow/agent_transfer.py
+@@ -41,6 +41,10 @@
+     origin_visit_id: str
+     announcement: str | None = None
+     play_greeting: bool = True
++    # Spoken by the DESTINATION agent as it takes over, in its own voice,
++    # without passing through the model. Only applies when play_greeting is
++    # false: with it true the node's own Start Call greeting already plays.
++    transfer_greeting: str | None = None
+     request_id: str = field(default_factory=lambda: f"xfer-{uuid.uuid4().hex[:10]}")
+     cancelled_reason: str | None = None
+ 
+@@ -190,6 +194,46 @@
+             engine.call_monitor.resume()
+             await engine.notify_agent_entered(destination)
+             start_node_id = destination.workflow.start_node_id
++            # The destination introduces itself by TTS, not through the model.
++            #
++            # With play_greeting false the destination's opening is an LLM
++            # generation. Whenever that generation comes out as a tool call --
++            # and it does, every time the caller's first question needs a
++            # lookup -- the opening turn is consumed by the tool and the
++            # introduction is lost. Measured on real calls: 0 of 2 when the
++            # first turn in the new language queried the knowledge base,
++            # 9 of 9 when it did not.
++            #
++            # Turning play_greeting on is not the fix: queue_node_opening
++            # returns after playing the node greeting and never runs the LLM,
++            # so the introduction replaces the continuation instead of
++            # preceding it.
++            #
++            # We wait for `started`, not for `wait()`. `started` flips when the
++            # opening boundary drains at the transport, and by then the
++            # TTSSpeakFrame has passed the LLM processor, so the generation
++            # queued next lands behind it. Waiting for the speech to FINISH
++            # costs ~3 s of silence before the answer; not waiting at all
++            # risks the reverse order, because run_llm queues straight onto
++            # the LLM while the speech still has hops to go.
++            #
++            # No greeting=True on purpose: it overrides append_to_context to
++            # False, and the context commit would then depend on
++            # GreetingController -- which never fires, because tracker.greeting
++            # is a single slot and the node opening overwrites this one.
++            # mute_user still blocks interruption: it is checked before the
++            # greeting exception in should_mute_user.
++            if request.transfer_greeting and not request.play_greeting:
++                speech = await engine.queue_speech(
++                    request.transfer_greeting,
++                    append_to_context=True,
++                    persist_to_logs=False,
++                    mute_user=True,
++                )
++                for _ in range(150):      # 3 s ceiling, never blocks the call
++                    if speech.started or speech.done:
++                        break
++                    await asyncio.sleep(0.02)
+             await engine.queue_node_opening(
+                 node_id=start_node_id,
+                 previous_node_id=None if request.play_greeting else start_node_id,
+--- a/api/services/workflow/pipecat_engine_custom_tools.py
++++ b/api/services/workflow/pipecat_engine_custom_tools.py
+@@ -589,6 +589,12 @@
+                 origin_visit_id=self._agent.visit_id,
+                 announcement=announcement,
+                 play_greeting=config.get("play_greeting", True),
++                # Formatted like the announcement so {{variables}} work here too.
++                transfer_greeting=(
++                    engine._format_prompt(str(config["transfer_greeting"]))
++                    if config.get("transfer_greeting")
++                    else None
++                ),
+             )
+ 
+             if not engine.transfer_coordinator.accept(request):
+--- a/api/schemas/tool.py
++++ b/api/schemas/tool.py
+@@ -609,6 +609,18 @@
+             "introducing itself."
+         ),
+     )
++    transfer_greeting: str | None = Field(
++        default=None,
++        max_length=500,
++        description=(
++            "Spoken by the destination agent as it takes over, in its own "
++            "voice, before its first generated turn. Only used when "
++            "play_greeting is false, and it is what makes the two compatible: "
++            "the destination gets an introduction that cannot be lost when the "
++            "opening generation is a tool call, and still continues the "
++            "conversation in the same breath. Supports template variables."
++        ),
++    )
+ 
+ 
+ class TransferAgentToolDefinition(BaseModel):
