@@ -1,0 +1,130 @@
+--- a/api/services/pipecat/agent_runtime_factory.py
++++ b/api/services/pipecat/agent_runtime_factory.py
+@@ -78,7 +78,11 @@
+         on_agent_error: Callable[[AgentRuntime, Any], Any] | None = None,
+         use_draft: bool = False,
+         observers: list[BaseObserver] | None = None,
++        stt: Any = None,
+     ):
++        # The call's STT service, so a transfer can point it at the
++        # destination's own transcription settings. See `retune_stt_for`.
++        self._stt = stt
+         self._on_agent_error = on_agent_error
+         self._use_draft = use_draft
+         self._organization_id = organization_id
+@@ -96,6 +100,60 @@
+         """The organization every agent in this call must belong to."""
+         return self._organization_id
+ 
++    async def retune_stt_for(self, runtime: AgentRuntime) -> bool:
++        """Point the call's STT at ``runtime``'s own transcription settings.
++
++        ``build`` creates an ``llm`` and a ``tts`` per agent, but the STT is
++        created once per call in ``run_pipeline`` and lives in the *call*
++        pipeline, not in an agent's generation pipeline. So a destination's
++        ``stt.language`` and ``stt.language_hints`` never take effect on a
++        transferred call: the whole call keeps listening with the first agent's
++        transcriber, while ``runtime_configuration`` reports an STT that is not
++        the one running.
++
++        On ``flux-general-multi`` the hints are a Configure field, so they are
++        changed on the open socket and nothing reconnects. Reconnecting is not
++        a safe alternative: we tried ``_disconnect()``/``_connect()`` first and
++        it left the socket reporting "ready to stream audio" while producing no
++        transcripts at all for the rest of the call, which matches the
++        ``_receive_task`` hazard described in
++        ``pipecat/services/deepgram/flux/stt.py``.
++
++        Returns True when the hints actually changed.
++        """
++        stt = self._stt
++        settings = getattr(stt, "_settings", None)
++        # Only the multilingual Flux model honours language hints.
++        if settings is None or getattr(settings, "model", None) != "flux-general-multi":
++            return False
++        stt_config = getattr(getattr(runtime, "user_config", None), "stt", None)
++        if stt_config is None:
++            return False
++
++        # Same composition as `create_stt_service`: the main language first,
++        # then the hints, resolved and de-duplicated. Worth extracting into one
++        # shared helper there rather than keeping two copies in step by hand.
++        from api.services.pipecat.service_factory import (
++            _resolve_deepgram_flux_language_hint,
++        )
++
++        codes = [
++            getattr(stt_config, "language", None),
++            *(getattr(stt_config, "language_hints", None) or []),
++        ]
++        hints = list(
++            dict.fromkeys(
++                hint for hint in map(_resolve_deepgram_flux_language_hint, codes) if hint
++            )
++        )
++        changed = await stt._update_settings(type(settings)(language_hints=hints))
++        if changed:
++            logger.info(
++                f"[transfer] STT retuned for visit {runtime.visit_id}: "
++                f"language_hints={[getattr(h, 'value', h) for h in hints]}"
++            )
++        return bool(changed)
++
+     async def resolve_destination(self, workflow_id: int) -> tuple[Any, Any]:
+         """Look up a destination workflow and pin the definition to run.
+ 
+--- a/api/services/pipecat/run_pipeline.py
++++ b/api/services/pipecat/run_pipeline.py
+@@ -1227,6 +1227,8 @@
+             on_agent_error=engine.handle_agent_error,
+             use_draft=bool(workflow_run.extra.get("use_draft")),
+             observers=[feedback_observer],
++            # The call owns the STT; a transfer retunes it for the destination.
++            stt=stt,
+         )
+         engine.set_agent_factory(agent_factory)
+         # The agent this call starts on. Its services were resolved above from
+--- a/api/services/workflow/agent_transfer.py
++++ b/api/services/workflow/agent_transfer.py
+@@ -21,6 +21,24 @@
+ from api.services.workflow.agent_handoff_context import build_handoff_snapshot
+ from api.services.workflow.agent_runtime import new_visit_id
+ 
++
++async def _retune_stt(engine, runtime) -> None:
++    """Hand the call's STT over to ``runtime`` before it starts listening.
++
++    Called while the hold audio is still playing, which is the one moment in a
++    transfer where a settings change cannot land in the middle of a caller's
++    sentence. A failure here must not fail the transfer: a destination
++    listening with the wrong language hints is far better than a dropped
++    handoff, so this logs and returns.
++    """
++    factory = getattr(engine, "_agent_factory", None)
++    if factory is None:
++        return
++    try:
++        await factory.retune_stt_for(runtime)
++    except Exception:  # noqa: BLE001 - see the docstring
++        logger.exception("[transfer] could not retune the call's STT; continuing")
++
+ TRANSFER_PREPARE_TIMEOUT_SECONDS = 20.0
+ TRANSFER_ACTIVATION_TIMEOUT_SECONDS = 5.0
+ TRANSFER_MIN_HOLD_SECONDS = 1.2
+@@ -174,6 +192,7 @@
+             if destination.error:
+                 raise AgentBuildError("destination_unusable", destination.error)
+             self._phase = TransferPhase.COMMITTING
++            await _retune_stt(engine, destination)
+             engine.commit_agent(destination, snapshot)
+             committed = True
+             # Opening can immediately call a tool and request another LLM turn.
+@@ -272,6 +291,8 @@
+                         engine.discard_pending_agent(destination)
+                 # The source and its shared conversation were never replaced.
+                 if not committed and not engine.is_call_disposed():
++                    # The source is listening again, so the STT goes back too.
++                    await _retune_stt(engine, source)
+                     if await engine.activate_agent(
+                         source, timeout=TRANSFER_ACTIVATION_TIMEOUT_SECONDS
+                     ):

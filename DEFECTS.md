@@ -22,8 +22,11 @@ reason this document exists: we would rather delete our patches than maintain th
 | 5 | `turn_start_strategy` inert with external-turn STT | not patched | in every call's log |
 | 6 | `max_call_duration` cuts with no goodbye | not patched | present in this image |
 | 7 | No way to brief the person who answers a transfer | **feature request** | the hook is already in your TwiML |
+| 8 | Template variables cannot take part of a value | **feature request** | the agent guesses the caller's digits |
+| 9 | `play_greeting` is all or nothing | **patched** | 0 of 2 vs 9 of 9 real calls |
+| 10 | The STT is never retuned on a transfer | **patched** | a call ended on a mis-transcribed "Sim" |
 
-Three diffs accompany this document and apply with `git apply` from the repository root. Happy to
+Six diffs accompany this document and apply with `git apply` from the repository root. Happy to
 open PRs.
 
 ---
@@ -448,6 +451,112 @@ rollback.**
 `agent_transfer.py`, `pipecat_engine_custom_tools.py` and the `TransferAgentConfig` schema. We are
 not attached to the shape — a third value on `play_greeting`, or a `greeting_mode`, would do the
 same job. What we need is the combination.
+
+## 10. The STT is created once per call, so a transferred call keeps listening with the source agent's transcriber
+
+**Where:** `api/services/pipecat/agent_runtime_factory.py` — `build()` creates an `llm` at line 171
+and a `tts` at line 172, and then only *reports* the STT at lines 224-225;
+`api/services/pipecat/run_pipeline.py:761` — `create_stt_service()`, called once, whose result goes
+into `build_pipeline(transport, stt, ...)`.
+
+A transfer rebuilds the per-agent services and attaches a new generation pipeline
+(`build_agent_generation_pipeline(llm, tts, ...)`). The STT is not one of them: it belongs to the
+*call* pipeline and is never rebuilt, retuned or even consulted again. The consequence:
+
+**the destination workflow's `stt.language` and `stt.language_hints` are dead configuration on any
+transferred call.**
+
+Two further effects worth naming:
+
+- `runtime_configuration` records `stt_provider` and `stt_model` for the destination
+  (`agent_runtime_factory.py:224-225`), so the run reports an STT that is **not** the one running.
+- The TTS *does* switch, so the asymmetry is invisible from the outside: the destination speaks in
+  its own voice while listening with somebody else's ears.
+
+### What it did on a real call
+
+Our English agent hands to a Portuguese agent. Both run `flux-general-multi`; the English one with
+`language_hint=en`, the Portuguese one with `pt` and `en`. After the handoff the call kept the
+English hint, and the damage fell entirely on **short** utterances — a full Portuguese sentence
+survived, a one-word answer did not:
+
+| what the caller said (Portuguese) | what the transcript got | length |
+|---|---|---|
+| "Qual tipo de restaurante?" | `Qual tipo de restaurante?` | 256 ms |
+| "Sim, pode mandar." | `Sim, pode mandar.` | 256 ms |
+| "você tem vinhos" | `você tem vinhos,` | 399 ms |
+| **"Sim"** | **`See.`** | 256 ms |
+| **"Sim"** (answering "anything else?") | **`Thank`** | **95 ms** |
+
+That last one ended the call: `Thank` read as a goodbye, the agent called `move_to_goodbye()`, and
+the caller — who had just said *yes, help me more* — heard the closing line and was hung up on.
+
+**Isolated with the recording.** Same `user.wav`, same window, same thresholds, only the hint
+changed:
+
+| `language_hint` | what Flux returned for that "Sim" |
+|---|---|
+| none | `Sim` |
+| **`en` only** (what was running) | **`See`** |
+| `en` + `pt` | `Sim` |
+| `pt` only | `Sim` |
+
+And the reverse holds on the English leg, from the recording of a different call: with `pt` in
+play, English audio comes back as `Lata` and `O Atomix` in the eager hypotheses — the final
+transcript is correct, but the agent acts on the eager one. So **there is no single hint list that
+serves both legs**, which is why this cannot be configured around.
+
+### THE TRAP: do not fix it by reconnecting
+
+Our first patch set `_settings.language_hints` and then called `_disconnect()` / `_connect()`. The
+log said the socket reconnected in 99-210 ms and reported `Connected to Flux - ready to stream
+audio`. **Transcription was dead for the rest of the call.** Three real calls, and the number of
+usable caller turns after the handoff:
+
+| | caller turns after handoff |
+|---|---|
+| before the patch (shared transcriber) | 7 |
+| with the reconnect patch, 3 calls | **0, 0, 1** |
+
+On the third the caller spoke and the agent asked *"are you still there?"* 22 seconds later. The
+cause is most likely the hazard your own comment describes at
+`pipecat/services/deepgram/flux/stt.py:195-203`: `_receive_task` is created inside
+`_connect_websocket`, and a reconnect raised from the receive handler can leave the first
+`_receive_task` alive. Our log shows exactly that race — `_disconnect()` closed the socket with an
+audio frame in flight, `send_with_retry` reconnected on its own, and our `_connect()` then hit the
+already-open guard.
+
+**No reconnect is needed.** `language_hints` is in `_CONFIGURE_FIELDS`
+(`flux/stt_base.py:187`), so `_update_settings` sends `{"type": "Configure", "language_hints":
+["pt"]}` on the open socket — which is what the field's own docstring says
+(*"Can be updated mid-stream via STTUpdateSettingsFrame"*, against `numerals`/`redact`, which are
+*"read only from the connection URL"*). One line:
+
+```python
+await stt._update_settings(type(settings)(language_hints=hints))
+```
+
+`apply_update` only touches *given* fields, so a delta carrying just `language_hints` leaves
+`keyterm` and the end-of-turn thresholds alone — we verified that with the real `Settings` class,
+because losing `keyterm` mid-call would cost us the dish names.
+
+**It works.** One real call so far on the fixed version: the hints changed with no reconnect, and
+the first Portuguese turn after the handoff came back whole — *"Para o dia vinte e nove."* — where
+the reconnect version had produced nothing. One call is not a sample; we will say so if it turns
+out otherwise.
+
+**What we would ask for:** retune or rebuild the STT as part of the handoff, next to the `llm` and
+`tts` that `build()` already creates. Our patch does it from the factory because that is where the
+destination's `user_config` already is, but the shape is yours to choose — what matters is that a
+destination's STT settings stop being inert.
+
+**The patch:** `item-10-stt-not-retuned-on-transfer.patch`. It touches `agent_runtime_factory.py`,
+`run_pipeline.py` and `agent_transfer.py`, and it applies **on top of item 9** (both edit
+`agent_transfer.py`). The composition of the hint list is copied from `create_stt_service`; one
+shared helper there would be better than two copies kept in step by hand.
+
+**Not visible from text chat**, for the same reason as the rest of this document: `transfer_agent`
+never runs there, and text chat has no STT at all.
 
 ## Other things we work around, on this same instance
 
