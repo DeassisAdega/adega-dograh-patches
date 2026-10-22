@@ -336,6 +336,76 @@ published `TRANSFER_FAILED` 24 seconds *after* the destination had already answe
 because the call had ended anyway, but on a long call it looks like it could tear down a transfer
 that is already up.
 
+### Update 2026-10-22 — the introduction is unreachable for speech-to-speech agents
+
+We moved this line to **Grok Voice 3.0** (realtime) and the introduction stopped existing. Not
+degraded — gone, and silently:
+
+```
+transfer_introduction.py | Transfer introduction skipped reason=realtime_agent
+```
+
+`introduction_enabled` is `true`, the transfer succeeds, and nothing tells the operator that the
+feature they switched on produces nothing. The UI shows it enabled. Only a container log line,
+at INFO, says otherwise.
+
+**The guard is sound; its conclusion is too broad.** The early return exists because
+`prepare_transfer_introduction` ends in `create_tts_service(agent.user_config, ...)`, and a
+speech-to-speech model has no separate TTS stage. We confirmed the premise in your registry:
+
+```python
+get_service_configuration(ServiceType.TTS, ServiceProviders.GROK_REALTIME)  # -> None
+```
+
+So the real requirement is **a TTS**, not **not realtime**. Two things follow, and we measured
+both:
+
+1. **A realtime configuration can carry a `tts` block.** `ModelConfigurationSpec.required_services`
+   only *requires* `realtime` in realtime mode; `tts` stays optional and validates fine. Your API
+   accepted the PATCH.
+2. **But it is then discarded.** `_active_roles(mode)` returns `{"llm", "embeddings", "realtime"}`
+   for realtime, and `if role in active` drops `tts` from the executable services — so
+   `user_config.tts` arrives `None` even though the operator configured one. Relaxing only the
+   early return is not enough; we tried, and got
+   `skipped reason=realtime_agent_without_tts` with a TTS plainly configured.
+
+**What we would ask for.** Not the TTS path — the `<Say>` one, the slot this item was originally
+about. When there is no clip, put the generated text in the destination's TwiML instead of the
+fixed sentence. No TTS provider, no synthesis, no Redis storage, no second HTTP fetch, and it
+works for every speech-to-speech provider at once.
+
+We built it and ran it on real Twilio calls against `main-35b38849`:
+
+```
+transfer_introduction.py | Whisper introduction ready words=15 language=pt-BR   (2.02 s)
+transfer_introduction.py | Whisper introduction ready words=17 language=en-US   (1.58 s)
+provider.py              | Twilio transfer API response status: 201
+```
+
+A human answered and heard it. Three notes, in case they save you time:
+
+- **The `<Say>` needs a `language` attribute**, and the summary follows the caller, so the
+  language has to come back with the text. We ask the model for a two-letter prefix (`pt|`,
+  `en|`, `es|`) in the same response rather than spending a second round trip before the dial,
+  and fall back to the default on anything unrecognised.
+- **Escape the text.** It comes from the conversation: one `&` or `<` in what the caller said
+  makes the TwiML invalid and Twilio **rejects the call**. We check two things, not one — that
+  the TwiML parses *and* that the spoken text comes back identical, because over-escaping would
+  have Twilio read "ampersand" out loud. 6/6.
+- **Generate it inside the hold-audio window.** Our first attempt produced the text after the
+  `finally` that stops the hold loop, which turned ~2 s of preparation into silence for a caller
+  who is already waiting.
+
+**It stays additive.** Pipeline agents keep the native clip in the agent's own voice; the `<Say>`
+only fills in when there is no clip. Proved by contrast on two workflows on the same image — the
+pipeline one logged `Transfer introduction ready ... audio_bytes=101164`, the realtime one logged
+`Whisper introduction ready ... language=pt-BR`.
+
+And it makes `introduction_audience` moot for this path: the `<Say>` lives only in the
+destination's TwiML, so the caller never hears it and `strategies.py` is not involved at all.
+
+Happy to open the PR — it is three files and no new dependency.
+
 ## 8. Template variables have no way to take part of a value, so the agent guesses the digits
 
 `{{initial_context.caller_number}}` can only be rendered whole. The only filter is the
