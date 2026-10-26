@@ -1,0 +1,58 @@
+diff --git a/api/services/pipecat/speech_playback.py b/api/services/pipecat/speech_playback.py
+--- a/api/services/pipecat/speech_playback.py
++++ b/api/services/pipecat/speech_playback.py
+@@ -233,12 +233,25 @@
+             source.add_event_handler(
+                 "on_before_push_frame", self._mark_response_boundaries
+             )
+ 
+     def _mark_response_boundaries(self, source: FrameProcessor, frame: Frame) -> None:
+         if isinstance(frame, LLMFullResponseStartFrame):
++            # One spoken turn is one response. This function assumes a single
++            # start/end pair per source: the first start consumes the
++            # expectation, and the next ones mint an orphan uuid and OVERWRITE
++            # `_response_sources`, so the `end` carries the id of the LAST one
++            # and the owning speech never gets an end boundary at all. It could
++            # then only be resolved by an interruption or by the 35 s timeout.
++            #
++            # While a response is still OPEN on this source, reuse its id. Two
++            # starts with no `end` between them are the same turn, not two.
++            open_id = self._response_sources.get(source)
++            if open_id:
++                frame.metadata["dograh_speech_id"] = open_id
++                return
+             speech = (
+                 self._expected_response if self._expected_source is source else None
+             )
+             # Unowned responses also need a scope so their audio cannot count as
+             # output for another speech request whose boundaries overlap them.
+             speech_id = speech.id if speech and not speech.done else str(uuid.uuid4())
+@@ -453,14 +466,26 @@
+                 self.note_output()
+         elif isinstance(frame, EndFrame):
+             self.cancel_all()
+ 
+     def note_output(self, frame: OutputAudioRawFrame | None = None) -> None:
+         """Record delivered audio, or delivered text in the text-chat adapter."""
+-        speech = (
+-            self.pending.get(self._output_scopes[-1]) if self._output_scopes else None
++        # Credit the innermost scope that is actually tracked, rather than the
++        # top of the stack. A realtime provider pushes SEVERAL
++        # LLMFullResponseStartFrame per spoken turn (three, on Grok Voice 3.0),
++        # and each one stacks an unowned scope on top of the owning speech, so
++        # the greeting's own audio was credited to nobody. Searching inside-out
++        # keeps the original intent of the guard: an unowned response's audio
++        # still cannot count for a speech sitting ABOVE it in the stack.
++        speech = next(
++            (
++                self.pending[scope]
++                for scope in reversed(self._output_scopes)
++                if scope in self.pending
++            ),
++            None,
+         )
+         if speech:
+             speech.has_output = True
+             if speech.first_output_at is None:
+                 speech.first_output_at = datetime.now(UTC).isoformat(
+                     timespec="milliseconds"

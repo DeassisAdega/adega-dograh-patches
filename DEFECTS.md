@@ -26,8 +26,9 @@ reason this document exists: we would rather delete our patches than maintain th
 | 9 | `play_greeting` is all or nothing | **patched** | 0 of 2 vs 9 of 9 real calls |
 | 10 | The STT is never retuned on a transfer | **patched** | a call ended on a mis-transcribed "Sim" |
 | 11 | The introduction never runs for speech-to-speech agents | **feature request** | enabled and silently skipped, 2 languages measured |
+| 12 | A realtime greeting never registers output, so it can only end by interruption | **patched** | `first_output_at=None` in 14 of 14 calls |
 
-Seven diffs accompany this document and apply with `git apply` from the repository root. Happy to
+Eight diffs accompany this document and apply with `git apply` from the repository root. Happy to
 open PRs.
 
 ---
@@ -632,6 +633,83 @@ And it makes `introduction_audience` moot for this path: the `<Say>` lives only 
 destination's TwiML, so the caller never hears it and `strategies.py` is not involved at all.
 
 Happy to open the PR — it is three files and no new dependency.
+
+## 12. A realtime greeting never registers output, so it can only end by an interruption
+
+**Patched, in two lines. This one breaks a documented feature, not a nice-to-have.**
+
+`Allow Greeting Interruption` says, in its own help text:
+
+> *"Let the caller interrupt the opening greeting. When off, caller speech is retained until the
+> greeting finishes. **Applies to cascade and realtime openings.**"*
+
+Turn it off on a Grok Voice 3.0 agent and **the call goes dead**. We measured it on our production
+line before we understood why: **6 of 9 calls** in that window had an assistant greeting and
+**zero** caller turns in the transcript. The caller hangs up; the operator sees a silent agent.
+
+### What actually happens
+
+Every realtime greeting logs this, with the flag **on** or **off** — 14 of 14 calls:
+
+```
+Greeting finished: speech_id=... outcome=interrupted first_output_at=None played_ms=0
+```
+
+`first_output_at=None` while the caller plainly hears the greeting. With the flag **on** nothing
+breaks, because the caller's own speech resolves the playback — which is why this has been
+invisible. With it **off** there is nothing left to resolve it, so `release_opening_input` waits
+out the 35 s `timeout` with the caller's audio gate shut.
+
+**The cause is that a realtime service pushes three `LLMFullResponseStartFrame` for one spoken
+turn.** We confirmed it at TRACE level and then with two `logger.warning` lines in
+`speech_playback.py`:
+
+```
+Greeting requested:   speech_id=9557792d...
+abertura: boundary_id=9557792d...  in_pending=True    <- the greeting's scope opens, correctly
+abertura: boundary_id=bbb3ca0d...  in_pending=False   <- an orphan stacks on top
+abertura: boundary_id=032dfc7b...  in_pending=False   <- and another
+```
+
+Two independent consequences, and each needed its own line:
+
+1. **`note_output` credits `self._output_scopes[-1]`** — the top of the stack. By the time audio
+   arrives the top is an orphan uuid, the `pending` lookup misses, and the greeting's audio is
+   credited to nobody.
+2. **`_mark_response_boundaries` assumes one start/end pair per source.** The first start consumes
+   the expectation; the next two mint orphan uuids and **overwrite** `_response_sources[source]`.
+   The `end` therefore carries the id of the *last* one, and **the owning speech never gets an end
+   boundary at all**.
+
+Fixing only the first gets `played_ms=10560` and `outcome=timed_out` — audio counted, call still
+useless. Both are needed.
+
+### After the patch, on real calls
+
+`allow_greeting_interrupt: false`, **text** greeting with a `{{template}}` in it:
+
+| check | result |
+|---|---|
+| the greeting resolves on its own | `outcome=played played_ms=10560` (before: never, 14 of 14) |
+| the call is not dead | caller turns present, agent answers |
+| the greeting cannot be cut | caller spoke at **3.12 s** and at **1.20 s** — greeting intact both times |
+| speech over the greeting is not lost | the question asked during the greeting was answered |
+| interruption *after* the greeting | still cuts normally, verified |
+
+### Why this matters beyond our line
+
+The workaround your docs suggest — *"static text greetings are not spoken by realtime
+speech-to-speech models; use an audio override"* — does not help, because a recorded greeting
+cannot carry a template, so a single workflow serving three locations cannot name the location.
+With this patch a **text** greeting works, template and all.
+
+**Not visible from text chat**, and not visible with the flag at its default, which is why we
+suspect nobody has reported it. The same question was asked in `#oss-support` on 2026-10-14
+(*"does the VAD and interruption settings are applicable to realtime models as well"*) and is
+still unanswered.
+
+Measured against `adega/dograh-api:main-35b38849` (our build of `main-35b38849`), Grok Voice 3.0,
+inbound Twilio calls.
 
 ## Other things we work around, on this same instance
 
