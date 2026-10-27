@@ -28,8 +28,9 @@ reason this document exists: we would rather delete our patches than maintain th
 | 11 | The introduction never runs for speech-to-speech agents | **feature request** | enabled and silently skipped, 2 languages measured |
 | 12 | A realtime greeting never registers output, so it can only end by interruption | **patched** | `first_output_at=None` in 14 of 14 calls |
 | 13 | The transfer leg is placed from the account's own number, so the destination never learns who is calling | **patched** | `From` == `To` on every transfer, 3 days |
+| 14 | Nothing records the transferred part of a call, and the run's own recording stops at the transfer | **patched** | 8 of 8 runs: 38 s recorded of a 250 s call |
 
-Nine diffs accompany this document and apply with `git apply` from the repository root. Happy to
+Ten diffs accompany this document and apply with `git apply` from the repository root. Happy to
 open PRs.
 
 ---
@@ -787,6 +788,94 @@ It is also the opposite of the usual caller-ID problem — there is no setting t
 Measured against `adega/dograh-api:main-35b38849` (our build of `main-35b38849`), inbound Twilio
 calls, SIP transfer to a FreePBX ring group. The file is byte-identical in `35b38849` and in
 today's `main`, so the patch applies to `main` unchanged.
+
+**On the recording of a transfer:** this patch deliberately does not touch it. When we first
+published this item we left recording out, on the grounds that trunk-level recording already
+covered the transferred conversation. That was wrong — item 14 has the measurement that shows it,
+and the patch.
+
+
+## 14. Nothing records the transferred part of a call, and the run's own recording stops at the transfer without saying so
+
+**Patched with one attribute in three places. But the attribute is the wrong shape for you — what
+we are asking for is a setting. See the end of this item.**
+
+A transferred call has two halves. The first, caller and agent, is in the run's own
+`recording_url`. The second, caller and whoever answered, is in **no artifact at all**, and nothing
+in the workflow or the tool configuration can ask for it.
+
+### What actually happens
+
+`recording_url` is presented as the recording of the call. On a transferred call it stops at the
+transfer, and nothing says so. Every run with a transfer on our production line, against the same
+call's duration in Twilio:
+
+| run | the run's recording covers | the call lasted |
+|---|---|---|
+| 1990 | 38 s | **250 s** |
+| 1975 | 104 s | **373 s** |
+| 1980 | 165 s | 223 s |
+| 1988 | 33 s | 124 s |
+| 1978 | 70 s | 124 s |
+| 1970 | 31 s | 75 s |
+| 1982 | 35 s | 72 s |
+| 1974 | 44 s | 41 s |
+
+Seven of the eight are short by the whole transferred conversation — in the worst one, 212 of 250
+seconds are missing. The eighth is the only one where the two agree; we did not chase why, and we
+are not going to claim it was a transfer that never connected without checking.
+
+There is nothing to find on the provider side either. Every transfer on one day, read back from
+the Twilio API:
+
+```
+13 of 13 transfer legs (outbound-api to a sip: URI)  ->  no recording
+76 of 76 inbound calls the agent answered            ->  no recording
+```
+
+We got this wrong ourselves first, and it is worth stating because the setup is common: **automatic
+trunk recording does not cover either of them.** An inbound call arrives on a Programmable Voice
+number rather than over the SIP trunk, and the transfer leg is a fresh outbound API call, so a
+trunk-level `record-from-answer` sees neither. The only reason it looked covered to us is that our
+first test call was dialled from our own PBX, which does traverse the trunk. A real caller does not.
+
+### Where
+
+The conference TwiML is built in three places, and none of them asks for recording:
+
+- `api/services/telephony/providers/twilio/provider.py:658` — the destination leg, in the inline TwiML posted to `/Calls.json`
+- `api/services/telephony/providers/twilio/strategies.py:72` — the caller's leg, in `TwilioConferenceStrategy.execute_transfer`
+- `api/services/telephony/providers/twilio/introduction.py:27` — the introduction path, built with `SubElement`
+
+### After the patch
+
+| check | result |
+|---|---|
+| a recording exists for the transferred part | yes, `source: Conference` (before: none, 13 of 13) |
+| it begins when both legs are in the conference | 12 s of a 22 s transfer — the whisper played to the person answering happens before that and is not captured |
+| the caller-and-agent half is untouched | still in the run's own recording; the two together cover the call |
+
+### What we are actually asking for
+
+Not this attribute. `record="record-from-start"` hardcoded is wrong for a product, for three
+reasons:
+
+1. **It costs money** — per minute recorded and per month stored.
+2. **It records the person who answers**, not only the caller. Florida, where we operate, requires
+   all-party consent; our caller hears *"you're on a recorded line"* in the greeting and the staff
+   member who answers hears nothing. Whether to record that leg is the operator's decision, which
+   means it has to be a toggle, not a constant.
+3. **The recording is born unreachable.** It appears in Twilio with nothing tying it to the
+   workflow run, so finding it means searching by timestamp.
+
+So: a setting beside `introduction_enabled` — `record_transfer`, off by default — and the resulting
+recording referenced from the run, the way `recording_url` already is. Then the operator decides,
+and whoever reviews the call can actually hear the half that matters most: the one with a human in
+it.
+
+Measured against `adega/dograh-api:main-35b38849` (our build of `main-35b38849`), inbound Twilio
+calls, SIP transfer to a FreePBX ring group. All three files are byte-identical in `35b38849` and
+in today's `main`, so the patch applies to `main` unchanged.
 
 ## Other things we work around, on this same instance
 

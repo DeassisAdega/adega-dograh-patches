@@ -1,0 +1,37 @@
+--- a/api/services/telephony/providers/twilio/provider.py
++++ b/api/services/telephony/providers/twilio/provider.py
+@@ -655,7 +655,7 @@
+ <Response>
+     <Say>You have answered a transfer call. Connecting you now.</Say>
+     <Dial>
+-        <Conference endConferenceOnExit="true">{conference_name}</Conference>
++        <Conference endConferenceOnExit="true" record="record-from-start">{conference_name}</Conference>
+     </Dial>
+ </Response>"""
+ 
+--- a/api/services/telephony/providers/twilio/strategies.py
++++ b/api/services/telephony/providers/twilio/strategies.py
+@@ -69,7 +69,7 @@
+             twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+ <Response>
+     <Dial>
+-        <Conference endConferenceOnExit="true">{conference_name}</Conference>
++        <Conference endConferenceOnExit="true" record="record-from-start">{conference_name}</Conference>
+     </Dial>
+ </Response>"""
+             data = {"Twiml": twiml}
+--- a/api/services/telephony/providers/twilio/introduction.py
++++ b/api/services/telephony/providers/twilio/introduction.py
+@@ -24,7 +24,11 @@
+         SubElement(response, "Play").text = audio_url
+     dial = SubElement(response, "Dial")
+     SubElement(
+-        dial, "Conference", endConferenceOnExit="true", beep="false"
++        dial,
++        "Conference",
++        endConferenceOnExit="true",
++        beep="false",
++        record="record-from-start",
+     ).text = conference_name
+     # A leg enters only AFTER its own clip finishes. The first waits alone;
+     # two-way audio starts once the second also completes playback and enters.
