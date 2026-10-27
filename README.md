@@ -39,8 +39,9 @@ repository; the copies in our container carry the same text in Portuguese.
 | `item-12-realtime-greeting-scope.patch` | `api/services/pipecat/speech_playback.py` | A realtime service pushes **three** `LLMFullResponseStartFrame` per spoken turn; each one stacks an unowned output scope on top of the owning speech, so the greeting never registers output (`first_output_at=None`, 14 of 14 calls) and can only be resolved by an interruption or by the 35 s timeout. With `allow_greeting_interrupt: false` the call goes dead — 6 of 9 on our production line — while the field's own help says it *"applies to cascade and realtime openings"*. | Two independent lines, and **both** are needed: fixing only the crediting gives `played_ms` but `outcome=timed_out`. The shape is a suggestion — the cleaner fix may be for the realtime adapter to emit one pair per turn. |
 | `item-13-transfer-leg-caller-id.patch` | `api/services/telephony/providers/twilio/provider.py` | The transfer leg is placed from the account's own number, so the destination sees the restaurant's own caller ID on every transferred call (`From` == `To`, every transfer over three days) and nothing afterwards can pair a transfer with the call that produced it | Only for `sip:` destinations — PSTN is unchanged, because Twilio requires an owned `From` there. Falls back to the account number on a refusal, so a transfer cannot fail because of it, but **that fallback is untested**. The small `_ReadResponse` wrapper exists only to keep the diff minimal; you will probably prefer to fold the retry into the existing read and drop it. |
 | `item-14-transfer-never-recorded.patch` | `api/services/telephony/providers/twilio/provider.py`, `strategies.py`, `introduction.py` | The transferred half of a call is recorded nowhere, and the run's own `recording_url` stops at the transfer without saying so — **8 of 8** transferred runs, one of them 38 s recorded of a 250 s call. The conference TwiML is built in three places and none asks for recording | **Do not merge the attribute.** Recording costs money and it records the person who answers, who in our case hears no notice — it needs to be a setting (`record_transfer`, off by default), and the resulting recording wants to be referenced from the run. Independent of item 13: both touch `provider.py`, and they apply cleanly in either order. |
+| `item-15-realtime-transcript-published-per-partial.patch` | `api/services/pipecat/realtime/grok_realtime.py` | Grok sends several cumulative `input_audio_transcription.completed` events for one utterance — **8** of them for one spoken sentence, same `item_id` — and each is published as `finalized=True`, so the aggregator joins eight growing prefixes of the same sentence into the turn text | The provider also **revises** words it already sent, so publishing just the new suffix does not work; and `response.created` is not a boundary — measured, it arrives before the last transcription event and twice per turn. Our shape publishes when the text stops growing. A provider that sends one final per utterance is unaffected. |
 
-The numbers are the item numbers in `DEFECTS.md`, which lists fourteen. They are not the
+The numbers are the item numbers in `DEFECTS.md`, which lists fifteen. They are not the
 one-two-three of the message that brought you here — go by the file each patch touches.
 
 ### On the boundary marker
@@ -53,7 +54,7 @@ restriction after the first turn. Worth knowing if you build the real fix.
 
 ## The write-up
 
-`DEFECTS.md` is the full document: fourteen items, with logs, timings and call counts. Three of them
+`DEFECTS.md` is the full document: fifteen items, with logs, timings and call counts. Three of them
 have no patch here, either because they cannot be fixed from outside the container or because they
 are feature requests. Items 1, 3 and 7 now carry a dated update saying what you shipped and what,
 if anything, is left.

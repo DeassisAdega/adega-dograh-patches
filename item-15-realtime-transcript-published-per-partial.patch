@@ -1,0 +1,50 @@
+--- a/api/services/pipecat/realtime/grok_realtime.py
++++ b/api/services/pipecat/realtime/grok_realtime.py
+@@ -75,6 +75,10 @@
+         # the text-greeting slot because the transcript may be None while the
+         # open itself is still pending.
+         self._pending_prerecorded_greeting: tuple[str | None] | None = None
++        # item_id -> [text, published]. A realtime provider can send several
++        # cumulative `input_audio_transcription.completed` events for one
++        # utterance; see _handle_evt_input_audio_transcription_completed.
++        self._transcript_by_item: dict = {}
+ 
+     async def process_frame(self, frame: Frame, direction: FrameDirection):
+         if isinstance(frame, LLMMessagesAppendFrame):
+@@ -358,9 +362,35 @@
+         if not transcript:
+             return
+ 
++        # Grok sends SEVERAL `input_audio_transcription.completed` events for one
++        # utterance -- same item_id, each carrying everything transcribed so far.
++        # Publishing each of them as finalized makes the aggregator join eight
++        # copies of the same sentence into the turn text. Publish once, when the
++        # text stops growing: an event identical to the previous one ends it.
++        item = str(getattr(evt, "item_id", "") or "")
++        state = self._transcript_by_item.get(item)
++        if state is None:
++            # A new utterance. Flush any earlier one still open, so that an
++            # utterance whose text never repeats is not lost.
++            for other, pending in list(self._transcript_by_item.items()):
++                if other != item and not pending[1] and pending[0]:
++                    pending[1] = True
++                    await self._publish_transcript(pending[0], evt)
++            self._transcript_by_item[item] = [transcript, False]
++            return
++        if state[1]:
++            return  # already published; the rest is echo
++        if transcript != state[0]:
++            state[0] = transcript
++            return  # still growing
++        state[1] = True
++        await self._publish_transcript(transcript, evt)
++
++    async def _publish_transcript(self, text: str, evt):
++        """Broadcast one finalized transcription for a completed utterance."""
+         await self.broadcast_frame(
+             TranscriptionFrame,
+-            text=transcript,
++            text=text,
+             user_id="",
+             timestamp=time_now_iso8601(),
+             result=evt,

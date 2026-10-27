@@ -29,8 +29,9 @@ reason this document exists: we would rather delete our patches than maintain th
 | 12 | A realtime greeting never registers output, so it can only end by interruption | **patched** | `first_output_at=None` in 14 of 14 calls |
 | 13 | The transfer leg is placed from the account's own number, so the destination never learns who is calling | **patched** | `From` == `To` on every transfer, 3 days |
 | 14 | Nothing records the transferred part of a call, and the run's own recording stops at the transfer | **patched** | 8 of 8 runs: 38 s recorded of a 250 s call |
+| 15 | A realtime provider's cumulative transcription is published once per partial, so the caller's sentence is repeated in the transcript | **patched** | 8 events for one spoken sentence |
 
-Ten diffs accompany this document and apply with `git apply` from the repository root. Happy to
+Eleven diffs accompany this document and apply with `git apply` from the repository root. Happy to
 open PRs.
 
 ---
@@ -876,6 +877,84 @@ it.
 Measured against `adega/dograh-api:main-35b38849` (our build of `main-35b38849`), inbound Twilio
 calls, SIP transfer to a FreePBX ring group. All three files are byte-identical in `35b38849` and
 in today's `main`, so the patch applies to `main` unchanged.
+
+## 15. A realtime provider's cumulative transcription is published once per partial, so the caller's sentence is repeated in the transcript
+
+**Patched. The conversation is unaffected — what this damages is everything that reads the call
+afterwards.**
+
+Grok Voice sends **several** `input_audio_transcription.completed` events for one utterance: same
+`item_id`, each carrying everything transcribed so far.
+`_handle_evt_input_audio_transcription_completed` publishes each of them as a finalized
+`TranscriptionFrame`, the user aggregator joins them into the turn text, and the stored transcript
+reads:
+
+```
+user: Have a Have a question. Have a question.
+user: Do you still Do you still have the promotion? Do you still have the promotion for
+      birthdays? Do you still have the promotion for birthdays where the birthday person
+      doesn't pay? ...
+```
+
+### What actually happens
+
+Two `logger.warning` lines in the handler, one bench call, one sentence spoken:
+
+```
+item=888810a2  'I would like to'
+item=888810a2  'I would like to book a table for six'
+item=888810a2  'I would like to book a table for six people this Saturday.'
+item=888810a2  '... this Saturday at seven in the evening'
+item=888810a2  '... and one of them'
+item=888810a2  '... and one of them is celebrating a birth'
+item=888810a2  '... and one of them is celebrating a birthday.'
+item=888810a2  '... and one of them is celebrating a birthday.'   <- identical to the previous one
+```
+
+**Eight events, one utterance, one `item_id`.** And note the fourth against the fifth: `at 7 in the
+evening` becomes `at seven in the evening`. The provider also **revises** what it already sent, so
+publishing only the new suffix is not an option.
+
+Two explanations we ruled out before patching, in case they look likely to you too:
+
+1. `transcript_log_coordinator.record_user_transcript` concatenates with `\n` — but the stored text
+   contains no newline. The join that produces it happens in the aggregator, with spaces.
+2. Nothing accumulates transcription `delta`s, anywhere in `api/` or in pipecat. Only the
+   `completed` handler exists.
+
+### Why `response.created` is not the boundary
+
+Our first design flushed the utterance when the model started answering. Measured, it does not hold:
+`response.created` arrives **before** the last transcription event, fires once before any caller
+speech at all, and arrives **twice** per turn — the same chattiness as item 12, where this service
+pushes three `LLMFullResponseStartFrame` for one spoken turn.
+
+The signal that does hold is the text itself. When an event repeats the previous text, the text has
+stopped growing and the utterance is over.
+
+### After the patch, on bench calls
+
+| check | result |
+|---|---|
+| a long sentence | stored once, in full — before, eight growing prefixes of it |
+| the same in the context-derived log | also once; both storage paths are fed from these frames |
+| **control: three distinct utterances** | all three preserved, none merged, none repeated |
+| an utterance whose text never repeats | flushed when the next utterance arrives, so it is not lost |
+
+### Why this matters beyond our line
+
+It does not degrade the conversation: with a speech-to-speech model the dialogue lives in the
+provider's session, not in this context. It degrades everything read afterwards — the stored
+transcript, the QA node's summary, call analysis, and any operator-facing view of a call. On our
+line a repeated fragment reached an automated report, and we stripped it there for four days before
+understanding where it came from.
+
+The guard belongs in the provider wrapper because the frame is published with `finalized=True`:
+nothing downstream can tell a partial from a final, and the aggregator is deliberately generic
+across providers. A provider that sends one final per utterance is unaffected by this patch.
+
+Measured against `adega/dograh-api:main-35b38849` (our build of `main-35b38849`), Grok Voice 3.0,
+inbound Twilio calls.
 
 ## Other things we work around, on this same instance
 
