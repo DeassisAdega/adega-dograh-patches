@@ -1,0 +1,100 @@
+--- a/api/services/telephony/providers/twilio/provider.py
++++ b/api/services/telephony/providers/twilio/provider.py
+@@ -26,6 +26,30 @@
+ 
+ if TYPE_CHECKING:
+     from fastapi import WebSocket
++
++
++class _ReadResponse:
++    """A Twilio response whose status and body were already read.
++
++    The retry below has to read both before it can decide whether to try again,
++    and the code that follows still expects an async context manager. Wrapping
++    the values keeps that code untouched.
++    """
++
++    def __init__(self, status, text):
++        self.status, self._text = status, text
++
++    async def text(self):
++        return self._text
++
++    async def json(self):
++        return json.loads(self._text)
++
++    async def __aenter__(self):
++        return self
++
++    async def __aexit__(self, *a):
++        return False
+ 
+ 
+ class TwilioProvider(TelephonyProvider):
+@@ -644,6 +668,42 @@
+         from_number = self.select_from_number()
+         logger.info(f"Selected phone number {from_number} for transfer call")
+ 
++        # When the destination is a PBX (a sip: URI), place the transfer leg with
++        # the CALLER's number as From. Whoever answers at the destination then
++        # sees who is calling, and the call log can pair the transfer with the
++        # inbound call by number instead of by timestamp alone.
++        #
++        # Only for sip: destinations. On a PSTN destination Twilio requires From
++        # to be a number the account owns, so the caller's number cannot be used.
++        #
++        # If Twilio refuses this From anyway, the request is retried once with
++        # the account number (see the retry below), so a transfer never fails
++        # because of this.
++        restaurant_from = from_number
++        if str(destination).startswith("sip:"):
++            try:
++                from api.services.telephony.call_transfer_manager import (
++                    get_call_transfer_manager,
++                )
++
++                _ctx = await (await get_call_transfer_manager()).get_transfer_context(
++                    transfer_id
++                )
++                if _ctx and _ctx.original_call_sid:
++                    async with aiohttp.ClientSession(
++                        timeout=aiohttp.ClientTimeout(total=5)
++                    ) as _s:
++                        async with _s.get(
++                            f"{self.base_url}/Calls/{_ctx.original_call_sid}.json",
++                            auth=aiohttp.BasicAuth(self.account_sid, self.auth_token),
++                        ) as _r:
++                            _caller = (await _r.json()).get("from") or ""
++                    if _caller.startswith("+") and len(_caller) >= 8:
++                        from_number = _caller
++                        logger.info("Transfer leg uses the caller's number")
++            except Exception as _e:  # never block the transfer over this
++                logger.warning(f"Caller number lookup failed: {_e}")
++
+         backend_endpoint, _ = await get_backend_endpoints()
+ 
+         status_callback_url = (
+@@ -694,7 +754,22 @@
+ 
+             async with aiohttp.ClientSession() as session:
+                 auth = aiohttp.BasicAuth(self.account_sid, self.auth_token)
+-                async with session.post(endpoint, data=data, auth=auth) as response:
++                # First attempt carries the caller's number. If Twilio refuses
++                # it as From, retry once with the account number -- the same
++                # value the transfer used before this change.
++                for _attempt in (1, 2):
++                    async with session.post(endpoint, data=data, auth=auth) as _resp:
++                        response_status = _resp.status
++                        response_text = await _resp.text()
++                    if response_status in [200, 201] or from_number == restaurant_from:
++                        break
++                    logger.warning(
++                        f"Twilio refused the caller's number as From "
++                        f"({response_status}); retrying with the account number"
++                    )
++                    from_number = restaurant_from
++                    data["From"] = restaurant_from
++                async with _ReadResponse(response_status, response_text) as response:
+                     response_status = response.status
+                     response_text = await response.text()
+ 

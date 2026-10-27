@@ -37,8 +37,9 @@ repository; the copies in our container carry the same text in Portuguese.
 | `item-10-stt-not-retuned-on-transfer.patch` | `api/services/pipecat/agent_runtime_factory.py`, `run_pipeline.py`, `api/services/workflow/agent_transfer.py` | `build()` recreates the `llm` and the `tts` for the destination but never touches the STT, which is created once per call — so a destination's `stt.language`/`language_hints` are **dead configuration** on any transferred call, and the whole call listens with the first agent's transcriber | Applies **on top of item 9**; both edit `agent_transfer.py`. **Do not fix this by reconnecting** — we tried, and it killed transcription for the rest of the call (**0, 0, 1** caller turns after the handoff across three real calls, against 7 before). `language_hints` is a Configure field; `_update_settings` is enough. |
 | `item-11-introduction-for-realtime-agents.patch` | `api/services/workflow/transfer_introduction.py`, `api/services/telephony/providers/twilio/provider.py`, `pipecat_engine_custom_tools.py` | The transfer introduction is silently skipped for speech-to-speech agents (`reason=realtime_agent`) while `introduction_enabled` is on | The guard tests *not realtime* when the requirement is *has a TTS*. Our shape puts the text in the destination's TwiML `<Say>` instead. |
 | `item-12-realtime-greeting-scope.patch` | `api/services/pipecat/speech_playback.py` | A realtime service pushes **three** `LLMFullResponseStartFrame` per spoken turn; each one stacks an unowned output scope on top of the owning speech, so the greeting never registers output (`first_output_at=None`, 14 of 14 calls) and can only be resolved by an interruption or by the 35 s timeout. With `allow_greeting_interrupt: false` the call goes dead — 6 of 9 on our production line — while the field's own help says it *"applies to cascade and realtime openings"*. | Two independent lines, and **both** are needed: fixing only the crediting gives `played_ms` but `outcome=timed_out`. The shape is a suggestion — the cleaner fix may be for the realtime adapter to emit one pair per turn. |
+| `item-13-transfer-leg-caller-id.patch` | `api/services/telephony/providers/twilio/provider.py` | The transfer leg is placed from the account's own number, so the destination sees the restaurant's own caller ID on every transferred call (`From` == `To`, every transfer over three days) and nothing afterwards can pair a transfer with the call that produced it | Only for `sip:` destinations — PSTN is unchanged, because Twilio requires an owned `From` there. Falls back to the account number on a refusal, so a transfer cannot fail because of it, but **that fallback is untested**. The small `_ReadResponse` wrapper exists only to keep the diff minimal; you will probably prefer to fold the retry into the existing read and drop it. |
 
-The numbers are the item numbers in `DEFECTS.md`, which lists ten. They are not the
+The numbers are the item numbers in `DEFECTS.md`, which lists thirteen. They are not the
 one-two-three of the message that brought you here — go by the file each patch touches.
 
 ### On the boundary marker
@@ -51,7 +52,7 @@ restriction after the first turn. Worth knowing if you build the real fix.
 
 ## The write-up
 
-`DEFECTS.md` is the full document: eight items, with logs, timings and call counts. Three of them
+`DEFECTS.md` is the full document: thirteen items, with logs, timings and call counts. Three of them
 have no patch here, either because they cannot be fixed from outside the container or because they
 are feature requests. Items 1, 3 and 7 now carry a dated update saying what you shipped and what,
 if anything, is left.

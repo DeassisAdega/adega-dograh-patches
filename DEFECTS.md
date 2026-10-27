@@ -27,8 +27,9 @@ reason this document exists: we would rather delete our patches than maintain th
 | 10 | The STT is never retuned on a transfer | **patched** | a call ended on a mis-transcribed "Sim" |
 | 11 | The introduction never runs for speech-to-speech agents | **feature request** | enabled and silently skipped, 2 languages measured |
 | 12 | A realtime greeting never registers output, so it can only end by interruption | **patched** | `first_output_at=None` in 14 of 14 calls |
+| 13 | The transfer leg is placed from the account's own number, so the destination never learns who is calling | **patched** | `From` == `To` on every transfer, 3 days |
 
-Eight diffs accompany this document and apply with `git apply` from the repository root. Happy to
+Nine diffs accompany this document and apply with `git apply` from the repository root. Happy to
 open PRs.
 
 ---
@@ -710,6 +711,82 @@ still unanswered.
 
 Measured against `adega/dograh-api:main-35b38849` (our build of `main-35b38849`), Grok Voice 3.0,
 inbound Twilio calls.
+
+## 13. The transfer leg is placed from the account's own number, so the destination never learns who is calling
+
+**Patched. Nothing crashes — the information is simply absent, and nothing downstream can recover
+it afterwards.**
+
+`TwilioProvider.transfer_call()` picks the outbound leg's caller ID at
+`api/services/telephony/providers/twilio/provider.py:644-645`:
+
+```
+from_number = self.select_from_number()
+logger.info(f"Selected phone number {from_number} for transfer call")
+```
+
+and posts it as `"From": from_number` to `/Calls.json`. That is one of the account's own numbers.
+Nothing in the file reads the inbound call — even though `transfer_context.original_call_sid` is
+already in hand in all three transfer modules: `provider.py`, `strategies.py`
+(`_find_transfer_context_for_call()`) and `introduction.py` (`process_introduction_status()`).
+
+### What actually happens
+
+Our destination is a PBX reached over SIP. Read back from the Twilio API, every transfer over three
+days looks like this — numbers masked, but `From` and `To` really are the same line:
+
+```
+From=+1555XXX1111   To=sip:+1555XXX1111@pbx.example.com    94 s   completed
+From=+1555XXX1111   To=sip:+1555XXX1111@pbx.example.com    40 s   completed
+From=+1555XXX1111   To=sip:+1555XXX1111@pbx.example.com   273 s   completed
+```
+
+The phone that rings shows the restaurant's own name, on every transferred call, and the PBX call
+log records the restaurant as the origin of a call that came from a customer.
+
+Three consequences, and the third is the one that costs us:
+
+1. **Whoever answers cannot tell a transferred customer from an internal call.** They pick up blind
+   to who is on the line.
+2. **The PBX call log cannot be used for this.** Every transferred call carries the same origin, so
+   the CDR joins to nothing.
+3. **Nothing can pair a transfer with the call that produced it.** We match the two to know whether
+   escalations are actually being answered; with one constant `From` the only key left is the
+   timestamp, and that collides as soon as two lines transfer in the same minute.
+
+### The patch, and the one thing it is careful about
+
+`From` becomes the inbound caller's number, looked up by `original_call_sid`, **only when the
+destination is a `sip:` URI**. On a PSTN destination Twilio requires `From` to be a number the
+account owns, so the caller's number is not usable there and nothing changes.
+
+Even on SIP we do not assume Twilio will accept it: the account's configuration is the authority.
+On a refusal the request is retried **once** with the account number — exactly the value the
+transfer used before this change. A transfer therefore cannot fail because of this patch.
+
+### After the patch, on a real call
+
+Transfer to an extension through a ring group, destination `sip:`:
+
+| check | result |
+|---|---|
+| the phone shows who is calling | the caller's number and city (before: the restaurant's own name, every call) |
+| the PBX call log agrees | CDR origin = the caller's number; answered on the extension, 22 s |
+| the transfer still succeeds | Twilio `201`, first attempt |
+| **the retry path** | **not exercised** — Twilio accepted the caller's number, so the fallback never ran. It is the branch we are least sure of, and we would rather say so than imply we tested it. |
+
+### Why this matters beyond our line
+
+Any deployment that hands calls to a PBX has the same gap, and it is invisible from inside Dograh:
+`transfer_success` reports on the INVITE, not on what the destination saw. We only found it by
+looking at the phone that rang.
+
+It is also the opposite of the usual caller-ID problem — there is no setting to get wrong.
+`select_from_number()` does exactly what its name says. Nothing ever asks for the caller.
+
+Measured against `adega/dograh-api:main-35b38849` (our build of `main-35b38849`), inbound Twilio
+calls, SIP transfer to a FreePBX ring group. The file is byte-identical in `35b38849` and in
+today's `main`, so the patch applies to `main` unchanged.
 
 ## Other things we work around, on this same instance
 
